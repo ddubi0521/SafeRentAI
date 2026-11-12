@@ -1,0 +1,27 @@
+{
+  "toolCode": "SAFE_RENT_AI",
+  "toolName": "AI 임대차 계약서 안전 분석",
+  "toolVersion": "1.0.0",
+  "description": "주택 임대차 계약서의 위험 문구 및 확인 누락 항목을 분석하고 PDF에 표시",
+  "axes": {
+    "frontend": true,
+    "backend": true,
+    "core": true
+  },
+  "frontend": {
+    "routePath": "/tools/safe-rent",
+    "menuName": "계약서 안전 분석"
+  },
+  "backend": {
+    "desiredBasePath": "/api/tools/safe-rent"
+  },
+  "environmentVariables": [
+    "CORE_BASE_URL",
+    "CORE_SHARED_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "JWT_ISSUER_URI",
+    "LOCAL_DEV_NO_AUTH",
+    "VITE_API_BASE"
+  ]
+}

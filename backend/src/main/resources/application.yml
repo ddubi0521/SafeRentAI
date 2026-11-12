@@ -1,0 +1,14 @@
+server:
+  port: 8081
+spring:
+  codec:
+    max-in-memory-size: 40MB
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI:https://issuer.invalid/}
+saferent:
+  core-url: ${CORE_BASE_URL:http://127.0.0.1:8001}
+  core-token: ${CORE_SHARED_TOKEN:}
+  local-dev-no-auth: ${LOCAL_DEV_NO_AUTH:false}
