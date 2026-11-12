@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SafeRent AI — 싱크인사이트 SR 제출용 MVP
 
 ## 1. 도구 개요
@@ -32,6 +33,3 @@ Windows PowerShell에서는 환경변수를 `$env:CORE_SHARED_TOKEN="local-test-
 ## 6. 도구 제출 및 확장
 희망 Frontend 경로 `/tools/safe-rent`, API 경로 `/api/tools/safe-rent`.
 manifest/API_SPEC/ENV.template/TEST_RESULT 포함. 싱크인사이트 CommonResponse의 구체적 객체 모양 및 라우팅은 SR 검토 후 최종 확정.
-
-### 다음 단계(미구현)
-법무부 표준 임대차계약서 버전 관리, 국가법령정보센터 법령/판례 API 인증·본문 조회·법령 시행일 필터링, 원문 인용 기반 RAG, 스캔 PDF OCR, 개인정보 마스킹, 감사 로그 및 보안 검토.
