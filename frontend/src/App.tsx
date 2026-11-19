@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {FileCheck2, ShieldCheck, UploadCloud, AlertCircle, Download} from 'lucide-react';
 
 type LegalReference = {
@@ -19,6 +19,8 @@ type LegalExplanation = {
         judgment_summary: string;
         issue: string;
         match_score: number;
+        relevance?: 'direct' | 'indirect';
+        relevance_reason?: string;
     } | null;
     risk_reason: string;
     verification_status: string;
@@ -64,9 +66,42 @@ type Result = {
 export default function App() {
     const [file, setFile] = useState<File | null>(null), [loading, setLoading] = useState(false), [result, setResult] = useState<Result | null>(null), [error, setError] = useState('');
     const [jwt, setJwt] = useState('');
+    const [elapsedSeconds, setElapsedSeconds] = useState(0);
+    const [lastDurationSeconds, setLastDurationSeconds] = useState<number | null>(null);
+    const [estimatedSeconds, setEstimatedSeconds] = useState<number | null>(() => {
+        try {
+            const raw = localStorage.getItem('saferent-analysis-times-v1');
+            const times: number[] = raw ? JSON.parse(raw) : [];
+            const valid = Array.isArray(times) ? times.filter(t => typeof t === 'number' && Number.isFinite(t) && t > 0) : [];
+            return valid.length ? Math.round(valid.reduce((a, b) => a + b, 0) / valid.length) : null;
+        } catch { return null; }
+    });
+    const startedAtRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        if (!loading) return;
+        const tick = () => {
+            if (startedAtRef.current !== null) {
+                setElapsedSeconds(Math.floor((Date.now() - startedAtRef.current) / 1000));
+            }
+        };
+        tick();
+        const interval = window.setInterval(tick, 1000);
+        return () => window.clearInterval(interval);
+    }, [loading]);
+
+    const formatDuration = (seconds: number) => {
+        const minutes = Math.floor(seconds / 60);
+        const remaining = seconds % 60;
+        return minutes > 0 ? `${minutes}분 ${remaining}초` : `${remaining}초`;
+    };
+
 
     async function analyze() {
         if (!file) return;
+        startedAtRef.current = Date.now();
+        setElapsedSeconds(0);
+        setLastDurationSeconds(null);
         setLoading(true);
         setError('');
         setResult(null);
@@ -81,6 +116,16 @@ export default function App() {
             const body = await res.json();
             if (!res.ok) throw new Error(body?.payload?.message || '분석 실패');
             setResult(body.data as Result);
+            const duration = Math.max(1, Math.round((Date.now() - startedAtRef.current!) / 1000));
+            setLastDurationSeconds(duration);
+            try {
+                const raw = localStorage.getItem('saferent-analysis-times-v1');
+                const oldTimes: number[] = raw ? JSON.parse(raw) : [];
+                const valid = Array.isArray(oldTimes) ? oldTimes.filter(t => typeof t === 'number' && Number.isFinite(t) && t > 0) : [];
+                const nextTimes = [...valid.slice(-4), duration];
+                localStorage.setItem('saferent-analysis-times-v1', JSON.stringify(nextTimes));
+                setEstimatedSeconds(Math.round(nextTimes.reduce((a, b) => a + b, 0) / nextTimes.length));
+            } catch { /* 저장이 차단된 환경에서는 이번 소요 시간만 표시 */ }
         } catch (e) {
             setError(e instanceof Error ? e.message : '알 수 없는 오류')
         } finally {
@@ -130,6 +175,26 @@ export default function App() {
                 <label className="token">JWT 액세스 토큰 (운영 인증 사용 시)
                     <input type="password" value={jwt} onChange={e => setJwt(e.target.value)} placeholder="로컬 개발 모드에서는 비워두세요"/></label>
                 <button disabled={!file || loading} onClick={analyze}>{loading ? '분석 중...' : '계약서 안전 분석 시작'}</button>
+                {loading && (
+                    <div className="sr-progress" role="status" aria-live="off">
+                        <div className="sr-progress-top">
+                            <strong>계약서를 분석하고 있어요</strong>
+                            <span>경과 {formatDuration(elapsedSeconds)}</span>
+                        </div>
+                        <div className="sr-progress-track"><div className="sr-progress-indeterminate" /></div>
+                        {estimatedSeconds === null ? (
+                            <p>첫 분석이라 예상 시간을 계산 중이에요. 완료 후 다음 분석부터 예상 시간이 표시됩니다.</p>
+                        ) : elapsedSeconds < estimatedSeconds ? (
+                            <p>이전 분석 평균 {formatDuration(estimatedSeconds)} · 예상 남은 시간 약 {formatDuration(estimatedSeconds - elapsedSeconds)}</p>
+                        ) : (
+                            <p>이전 분석 평균 {formatDuration(estimatedSeconds)}을 지났어요. 계속 분석 중이며 곧 완료된다는 보장은 없어요.</p>
+                        )}
+                        <small>실제 서버 진행률이 아닌 과거 분석 시간 기반 추정치예요.</small>
+                    </div>
+                )}
+                {!loading && result && lastDurationSeconds !== null && (
+                    <div className="sr-completed-time">분석 완료 · 총 {formatDuration(lastDurationSeconds)} 소요</div>
+                )}
                 {error && <div className="error">{error}</div>}
             </section>
             {result && <section className="panel results">
@@ -143,120 +208,106 @@ export default function App() {
                     </div>
                     <div><strong>{result.missing_checks.length}</strong><span>미확인 항목</span></div>
                 </div>
-                {result.findings.length === 0 ?
-                    <p>사전 정의된 위험 문구가 발견되지 않았습니다. 안전하다는 의미는 아닙니다.</p> : result.findings.map((f, i) => <article key={i} className={'finding ' + f.severity}>
-                        <div className="row">
-                            <b>{f.title}</b>
-                            <span className={'chip ' + f.severity}>{f.severity === 'danger' ? '위험' : '주의'}</span>
-                        </div>
-                        <blockquote>{f.quote}</blockquote>
-                        <p>{f.reason}</p>
-                        <p><b>권고:</b> {f.recommendation}</p>
-                        <small>{f.page}페이지 · 원문 표시 {f.highlighted ? '성공' : '실패(텍스트 배치 확인 필요)'}</small>
-                        {/* 관련 법령 */}
-                        {(f.related_laws?.length ?? 0) > 0 && (
-                            <div className="legal-section">
-                                <h4>📘 관련 법령 검색 결과</h4>
-                                <ul>
-                                    {f.related_laws!.map((law, index) => (
-                                        <li key={index}>
-                                            <b>{law.name}</b>
-                                            {law.id != null && (
-                                                <span> (법령 ID: {law.id})</span>
-                                            )}
-                                        </li>
-                                    ))}
-                                </ul>
+                {result.findings.length === 0 ? (
+                    <p>사전 정의된 위험 문구가 발견되지 않았습니다. 안전하다는 의미는 아닙니다.</p>
+                ) : result.findings.map((f, i) => {
+                    const legal = f.legal_explanation;
+                    const ai = f.llm_analysis;
+                    const hasCase = Boolean(legal?.case);
+                    return (
+                        <article key={i} className={'finding ' + f.severity + ' sr-finding'}>
+                            <div className="sr-finding-head">
+                                <div>
+                                    <span className="sr-overline">발견된 위험 신호 {String(i + 1).padStart(2, '0')}</span>
+                                    <h3>{f.title}</h3>
+                                </div>
+                                <span className={'chip ' + f.severity}>{f.severity === 'danger' ? '위험' : '주의'}</span>
                             </div>
-                        )}
+                            <div className="sr-quote"><span>계약서 원문</span><p>“{f.quote}”</p></div>
+                            <p className="sr-summary">{f.reason}</p>
+                            <div className="sr-recommend"><strong>권고 사항</strong><p>{f.recommendation}</p></div>
+                            <div className="sr-meta">{f.page != null ? `${f.page}페이지` : '페이지 정보 없음'} · PDF 원문 표시 {f.highlighted ? '완료' : '미확인'}</div>
 
-                        {/* 법적 근거 분석 */}
-                        {f.legal_explanation && (
-                            <div className="legal-section">
-                                <h4>⚖️ 법적 근거 분석</h4>
+                            {legal && (
+                                <div className="sr-analysis">
+                                    <div className="sr-analysis-heading">
+                                        <h4>법률 근거 및 AI 분석</h4>
+                                        <span>{ai ? 'AI 설명 포함' : '규칙 기반 설명'}</span>
+                                    </div>
+                                    <section className="sr-info-card">
+                                        <h5>관련 법률 조문</h5>
+                                        <strong>{legal.law_name}{legal.article_number != null ? ` 제${legal.article_number}조` : ''}</strong>
+                                        <p>{legal.article_text || '조문 원문을 확인하지 못했습니다.'}</p>
+                                    </section>
 
-                                <p>
-                                    <b>① 위험 조항</b>
-                                </p>
-                                <blockquote>{f.quote}</blockquote>
-
-                                <p>
-                                    <b>② 관련 법률 조문</b>
-                                </p>
-                                <p>
-                                    {f.legal_explanation.law_name}
-                                    {f.legal_explanation.article_number != null &&
-                                        ` 제${f.legal_explanation.article_number}조`}
-                                </p>
-
-                                {f.legal_explanation.article_text ? (
-                                    <p>{f.legal_explanation.article_text}</p>
-                                ) : (
-                                    <p>조문 원문을 확인하지 못했습니다.</p>
-                                )}
-
-                                <p>
-                                    <b>③ 관련 판례의 판단 내용</b>
-                                </p>
-
-                                {f.legal_explanation.case ? (
-                                    <>
-                                        <p>
-                                            {f.legal_explanation.case.name}
-                                            {' ('}
-                                            {f.legal_explanation.case.case_number}
-                                            {')'}
-                                        </p>
-
-                                        <p>
-                                            {f.legal_explanation.case.judgment_summary}
-                                        </p>
-                                    </>
-                                ) : (
-                                    <p>관련 판례의 판단 내용을 확인하지 못했습니다.</p>
-                                )}
-
-
-                                <p><b>④ 위험한 이유</b></p>
-
-                                {f.llm_analysis ? (
-                                    <>
-                                        <p>{f.llm_analysis.risk_analysis}</p>
-
-                                        {f.llm_analysis.case_summary && (
+                                    <section className="sr-info-card">
+                                        <h5>관련 판례</h5>
+                                        {hasCase && legal.case ? (
                                             <>
-                                                <p><b>⑤ AI 판례 핵심 요약</b></p>
-                                                <p>{f.llm_analysis.case_summary}</p>
+                                                <strong>{legal.case.name} ({legal.case.case_number})</strong>
+                                                {legal.case.relevance && (
+                                                    <div className="sr-case-verification">
+                                                        <span className="sr-case-badge">
+                                                            {legal.case.relevance === 'direct' ? '직접 관련 판례' : '간접 관련 · 참고 판례'}
+                                                        </span>
+                                                        {legal.case.relevance_reason && (
+                                                            <>
+                                                                <p className="sr-case-reason-preview">{legal.case.relevance_reason}</p>
+                                                                <details className="sr-case-reason-details">
+                                                                    <summary>관련성 검토 이유 전체 보기</summary>
+                                                                    <p>{legal.case.relevance_reason}</p>
+                                                                </details>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                <details className="sr-details">
+                                                    <summary>판결 내용 자세히 보기</summary>
+                                                    <p>{legal.case.judgment_summary || '판결요지 원문이 제공되지 않았습니다.'}</p>
+                                                </details>
                                             </>
+                                        ) : (
+                                            <div className="sr-empty">현재 검색 조건에서 적절한 관련 판례를 확보하지 못했습니다. 관련 판례가 존재하지 않는다는 의미는 아닙니다.</div>
                                         )}
+                                    </section>
 
-                                        {f.llm_analysis.limitations && (
-                                            <>
-                                                <p><b>⑥ 추가 확인 사항</b></p>
-                                                <p>{f.llm_analysis.limitations}</p>
-                                            </>
+                                    <section className="sr-info-card sr-ai-card">
+                                        <h5>위험한 이유 {ai ? <span className="sr-ai-label">AI 분석</span> : null}</h5>
+                                        <p>{ai?.risk_analysis || legal.risk_reason}</p>
+                                    </section>
+
+                                    <section className="sr-info-card">
+                                        <h5>AI 판례 핵심 요약</h5>
+                                        {ai?.case_summary ? (
+                                            <p>{ai.case_summary}</p>
+                                        ) : !hasCase ? (
+                                            <div className="sr-empty">적절한 관련 판례를 확보하지 못해 AI 판례 요약을 제공하지 않습니다.</div>
+                                        ) : (
+                                            <div className="sr-empty">AI 판례 요약이 제공되지 않았습니다.</div>
                                         )}
+                                    </section>
 
-                                        <small>
-                                            AI가 검색된 법률·판례를 바탕으로
-                                            생성한 참고용 설명입니다.
-                                        </small>
-                                    </>
-                                ) : (
-                                    <p>
-                                        {f.legal_explanation.risk_reason}
-                                        <small> (규칙 기반 분석)</small>
-                                    </p>
-                                )}
+                                    {ai?.limitations && (
+                                        <section className="sr-info-card sr-caution-card">
+                                            <h5>추가 확인 사항</h5>
+                                            <p>{ai.limitations}</p>
+                                        </section>
+                                    )}
 
-                                <small>
-                                    {f.legal_explanation.verification_status}
-                                    {' · '}
-                                    실제 법적 적용 여부는 별도 검토가 필요합니다.
-                                </small>
-                            </div>
-                        )}
-                    </article>)}
+                                    {(f.related_laws?.length ?? 0) > 0 && (
+                                        <details className="sr-reference-details">
+                                            <summary>검색된 관련 법령 목록 ({f.related_laws!.length}건)</summary>
+                                            <ul>{f.related_laws!.map((law, index) => (
+                                                <li key={index}>{law.name}{law.id != null ? ` · 법령 ID ${law.id}` : ''}</li>
+                                            ))}</ul>
+                                        </details>
+                                    )}
+                                    <p className="sr-disclaimer">{ai ? 'AI가 조회된 법률·판례를 바탕으로 생성한 참고용 설명입니다. ' : ''}{legal.verification_status} · 실제 법적 적용 여부는 별도 검토가 필요합니다.</p>
+                                </div>
+                            )}
+                        </article>
+                    );
+                })}
                 <h3>계약서에서 확인되지 않은 항목</h3>{result.missing_checks.length ?
                 <ul>{result.missing_checks.map(x => <li key={x}>{x}</li>)}</ul> :
                 <p>기본 확인 항목의 키워드가 모두 발견되었습니다. 조항의 적정성은 별도 검토가 필요합니다.</p>}

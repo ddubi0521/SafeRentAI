@@ -13,8 +13,10 @@ from pydantic import BaseModel, Field
 from app.law_api import search_laws, search_cases
 from app.legal_reasoning import build_legal_explanation # 법적 근거 분석
 from app.llm_analysis import analyze_with_llm # OpenAPI 설정
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="SafeRent Core", version="1.0.0")
+print("[서버 확인] 실행 파일:", __file__, flush=True)
 MAX_FILE = 20 * 1024 * 1024
 
 class Finding(BaseModel):
@@ -107,16 +109,23 @@ def analyze_text(pages: list[str]) -> tuple[list[Finding],list[str]]:
     return findings, missing
 
 # 법적 근거 분석
-def attach_legal_explanations(findings: list[Finding]):
-    cache = {}
+def attach_legal_explanations(findings):
+    titles = list(dict.fromkeys(
+        finding.title for finding in findings
+    ))
+
+    if not titles:
+        return findings
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = list(
+            executor.map(build_legal_explanation, titles)
+        )
+
+    cache = dict(zip(titles, results))
 
     for finding in findings:
-        if finding.title not in cache:
-            cache[finding.title] = build_legal_explanation(
-                finding.title
-            )
-
-        finding.legal_explanation = cache[finding.title]
+        finding.legal_explanation = cache.get(finding.title)
 
     return findings
 
@@ -186,9 +195,11 @@ def attach_legal_references(findings: list[Finding]):
     return findings
 
 # OpenAPI 설정
-def attach_llm_analyses(findings: list[Finding]):
+def attach_llm_analyses(findings):
     cache = {}
+    tasks = {}
 
+    # 1. 분석이 필요한 조항 수집
     for finding in findings:
         explanation = finding.legal_explanation
 
@@ -197,21 +208,51 @@ def attach_llm_analyses(findings: list[Finding]):
 
         key = (finding.title, finding.quote)
 
-        if key not in cache:
-            try:
-                cache[key] = analyze_with_llm(
-                    finding.quote,
-                    explanation,
-                )
-            except Exception as e:
-                print(
-                    "LLM 분석 실패:",
-                    type(e).__name__,
-                    str(e)[:200],
-                )
-                cache[key] = None
+        # 동일한 조항 중복 분석 방지
+        if key not in tasks:
+            tasks[key] = (
+                finding.quote,
+                explanation,
+            )
 
-        finding.llm_analysis = cache[key]
+    if not tasks:
+        return findings
+
+    # 2. GPT 분석 함수
+    def run_analysis(task):
+        key, (quote, explanation) = task
+
+        try:
+            result = analyze_with_llm(
+                quote,
+                explanation,
+            )
+            return key, result
+
+        except Exception as e:
+            print(
+                "[GPT 위험 분석 실패]",
+                str(e),
+                flush=True,
+            )
+            return key, None
+
+    # 3. 최대 3개 조항 병렬 분석
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        results = executor.map(
+            run_analysis,
+            tasks.items(),
+        )
+
+        for key, result in results:
+            cache[key] = result
+
+    # 4. 기존 findings에 결과 연결
+    for finding in findings:
+        key = (finding.title, finding.quote)
+
+        if key in cache:
+            finding.llm_analysis = cache[key]
 
     return findings
 
@@ -258,9 +299,22 @@ async def analyze(file: UploadFile = File(...), x_core_token: str | None = Heade
     except Exception:
         raise HTTPException(422,'PDF 분석 실패: 파일 형식을 확인하세요')
 
+    t0 = time.perf_counter()
+
     findings = attach_legal_references(findings)
+    t1 = time.perf_counter()
+    print(f"[시간] 법령·판례 검색: {t1-t0:.2f}초", flush=True)
+
     findings = attach_legal_explanations(findings) # 법적 근거 분석
-    # findings = attach_llm_analyses(findings) # OpenAPI 설정
+    t2 = time.perf_counter()
+    print(f"[시간] 판례 검증 및 법률 설명: {t2-t1:.2f}초", flush=True)
+
+    findings = attach_llm_analyses(findings) # OpenAPI 설정
+    t3 = time.perf_counter()
+    print(f"[시간] GPT 위험 분석: {t3-t2:.2f}초", flush=True)
+
+    print(f"[시간] 세 단계 합계: {t3-t0:.2f}초", flush=True)
+
 
     return Analysis(filename=file.filename,findings=findings,missing_checks=missing,
         extracted_chars=sum(map(len,pages)),annotated_pdf_base64=base64.b64encode(pdf).decode(),
@@ -287,6 +341,4 @@ def get_cases(query: str = "임대차보증금"):
             status_code=502,
             detail="판례 검색 API 호출 실패"
         )
-
-
 

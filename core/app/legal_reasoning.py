@@ -1,6 +1,8 @@
 import re
 import json
 from html import unescape
+from app.llm_analysis import verify_case_relevance
+from app.llm_analysis import verify_cases_batch
 
 from app.law_api import (
     search_laws,
@@ -13,9 +15,15 @@ from app.law_api import (
 # 위험 유형별 검토할 법률과 판례 검색 조건
 LEGAL_RULES = {
     "보증금 반환 제한": {
+        "risk_title": "보증금 반환 제한",
         "law": "민법",
         "article": 536,
         "case_query": "임대차보증금 반환",
+        "case_queries": [
+            "임대차보증금 반환",
+            "보증금 반환 지체",
+            "임대차 동시이행",
+        ],
         "topic_keywords": [
             "보증금반환의무",
             "임대차보증금",
@@ -40,9 +48,15 @@ LEGAL_RULES = {
     },
 
     "과도한 수선비 부담": {
+        "risk_title": "과도한 수선비 부담",
         "law": "민법",
         "article": 623,
         "case_query": "임대인 수선의무",
+        "case_queries": [
+            "임대인 수선의무",
+            "임대차 수선비용",
+            "임대차 수선의무",
+        ],
         "topic_keywords": [
             "수선의무",
             "수선비용",
@@ -64,9 +78,15 @@ LEGAL_RULES = {
     },
 
     "임대인의 임의 출입": {
+        "risk_title": "임대인의 임의 출입",
         "law": "형법",
         "article": 319,
         "case_query": "주거침입",
+        "case_queries": [
+            "주거침입",
+            "임대인 주거침입",
+            "거주자 의사 주거침입",
+        ],
         "topic_keywords": [
             "주거의 평온",
             "주거침입죄",
@@ -89,6 +109,7 @@ LEGAL_RULES = {
     },
 
     "일방적인 계약 해지": {
+        "risk_title": "일방적인 계약 해지",
         "law": "민법",
         "article": 635,
         "case_query": "임대차계약 해지",
@@ -96,6 +117,11 @@ LEGAL_RULES = {
             "임대차계약 해지",
             "해지통고",
             "계약해지",
+        ],
+        "case_queries": [
+            "임대차계약 해지",
+            "임대차 해지통고",
+            "임대차 해지 특약",
         ],
         "exclude_keywords": [],
         "reason": (
@@ -109,9 +135,15 @@ LEGAL_RULES = {
     },
 
     "관리비 변경 재량": {
+        "risk_title": "관리비 변경 재량",
         "law": None,
         "article": None,
         "case_query": "임대차 관리비",
+        "case_queries": [
+            "임대차 관리비",
+            "관리비 인상",
+            "관리비 변경",
+        ],
         "topic_keywords": [
             "관리비",
             "관리비 인상",
@@ -287,20 +319,51 @@ def score_case(case_data, rule):
     return score if score >= 4 else -1
 
 
+
+
 def find_relevant_case(query, rule):
-    data = search_cases(query)
-    root = data.get("PrecSearch", {})
-    items = as_list(root.get("prec", []))
+    queries = rule.get("case_queries") or [query]
 
-    best_case = None
-    best_score = -1
+    candidates = {}
+    MAX_CANDIDATES_PER_QUERY = 5
+    MAX_DETAIL_REQUESTS = 10
+    MAX_LLM_CHECKS = 3
 
-    # 검색된 판례 중 최대 3개 상세 조회
-    for item in items[:3]:
-        case_id = item.get("판례일련번호")
+    # 1. 여러 검색어로 판례 후보 수집
+    for search_query in queries:
+        try:
+            data = search_cases(search_query)
+            root = data.get("PrecSearch", {})
+            items = as_list(root.get("prec", []))
 
-        if not case_id:
-            continue
+            print(
+                f"[판례 검색] {search_query}: "
+                f"{len(items)}건 반환"
+            )
+
+            for item in items[:MAX_CANDIDATES_PER_QUERY]:
+                case_id = item.get("판례일련번호")
+
+                if not case_id:
+                    continue
+
+                case_id = str(case_id)
+
+                if case_id not in candidates:
+                    candidates[case_id] = item
+
+        except Exception as e:
+            print("[판례 검색 실패]", e)
+
+    # 2. 기존 키워드 점수 계산
+    scored_cases = []
+    checked = 0
+
+    for case_id, item in candidates.items():
+        if checked >= MAX_DETAIL_REQUESTS:
+            break
+
+        checked += 1
 
         try:
             detail = get_case_detail(case_id)
@@ -308,11 +371,15 @@ def find_relevant_case(query, rule):
 
             score = score_case(case_data, rule)
 
-            if score <= best_score:
+            print(
+                f"[판례 평가] {case_id}: "
+                f"관련성 점수 {score}"
+            )
+
+            if score < 0:
                 continue
 
-            best_score = score
-            best_case = {
+            case = {
                 "name": clean_text(
                     case_data.get(
                         "사건명",
@@ -335,10 +402,88 @@ def find_relevant_case(query, rule):
                 "match_score": score,
             }
 
-        except Exception as e:
-            print("판례 상세 조회 실패:", e)
+            scored_cases.append(case)
 
-    return best_case
+        except Exception as e:
+            print(
+                "[판례 상세 조회 실패]",
+                case_id,
+                e,
+            )
+
+    if not scored_cases:
+        print("[판례 미확보] 키워드 기준 통과 없음")
+        return None
+
+    # 3. 키워드 점수 상위 3개 선택
+    scored_cases.sort(
+        key=lambda c: c["match_score"],
+        reverse=True,
+    )
+
+    top_cases = scored_cases[:MAX_LLM_CHECKS]
+
+    direct_cases = []
+    indirect_cases = []
+
+    # 4. GPT로 판례 3개를 한 번에 검증
+    verification_results = verify_cases_batch(
+        clause_title=rule.get("risk_title", query),
+        clause_text=rule["reason"],
+        cases=top_cases,
+    )
+
+    for case, verification in zip(
+            top_cases,
+            verification_results,
+    ):
+        relevance = verification.get(
+            "relevance", "unverified"
+        )
+        reason = verification.get("reason", "")
+
+        print(
+            f"[GPT 판례 검증] "
+            f"{case['case_number']}: "
+            f"{relevance}"
+        )
+        print(f"[검증 이유] {reason}")
+
+        # 관련성이 없거나 검증에 실패한 판례는 제외
+        if relevance not in ("direct", "indirect"):
+            continue
+
+        case["relevance"] = relevance
+        case["relevance_reason"] = reason
+
+        if relevance == "direct":
+            direct_cases.append(case)
+
+        elif relevance == "indirect":
+            indirect_cases.append(case)
+
+    # 5. 직접 관련 판례를 우선 선택
+    if direct_cases:
+        selected = direct_cases[0]
+
+    elif indirect_cases:
+        selected = indirect_cases[0]
+
+    else:
+        print(
+            "[판례 미확보] GPT 검증에서 "
+            "적절한 판례를 확보하지 못했습니다."
+        )
+        return None
+
+    print(
+        "[최종 선택 판례]",
+        selected["case_number"],
+        selected["relevance"],
+    )
+
+    return selected
+
 
 
 def build_legal_explanation(title):
