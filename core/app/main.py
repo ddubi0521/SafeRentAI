@@ -14,6 +14,7 @@ from app.law_api import search_laws, search_cases
 from app.legal_reasoning import build_legal_explanation # 법적 근거 분석
 from app.llm_analysis import analyze_with_llm # OpenAPI 설정
 from concurrent.futures import ThreadPoolExecutor
+from app.llm_detection import detect_risks_with_llm
 
 app = FastAPI(title="SafeRent Core", version="1.0.0")
 print("[서버 확인] 실행 파일:", __file__, flush=True)
@@ -128,6 +129,63 @@ def attach_legal_explanations(findings):
         finding.legal_explanation = cache.get(finding.title)
 
     return findings
+
+
+def attach_llm_detected_findings(
+        findings: list[Finding],
+        pages: list[str],
+) -> list[Finding]:
+
+    candidates = detect_risks_with_llm(pages)
+
+    # 기존 RULES의 위험도와 기본 설명 재사용
+    rule_map = {
+        title: (severity, reason, recommendation)
+        for severity, title, pattern, reason, recommendation in RULES
+    }
+
+    for item in candidates:
+        title = item["title"]
+        quote = item["quote"]
+        page = item["page"]
+
+        if title not in rule_map:
+            continue
+
+        # 동일 페이지, 동일 유형의 중복 탐지 방지
+        duplicate = any(
+            f.title == title
+            and f.page == page
+            and (
+                    f.quote in quote
+                    or quote in f.quote
+            )
+            for f in findings
+        )
+
+        if duplicate:
+            continue
+
+        severity, default_reason, default_recommendation = (
+            rule_map[title]
+        )
+
+        findings.append(
+            Finding(
+                severity=severity,
+                title=title,
+                quote=quote,
+                reason=item.get("reason") or default_reason,
+                recommendation=(
+                        item.get("recommendation")
+                        or default_recommendation
+                ),
+                page=page,
+            )
+        )
+
+    return findings
+
 
 def attach_legal_references(findings: list[Finding]):
     """위험 조항에 관련 법령 및 판례 검색 결과 연ㅁ결"""
@@ -290,14 +348,50 @@ async def analyze(file: UploadFile = File(...), x_core_token: str | None = Heade
             raise HTTPException(422,'암호화 PDF는 지원하지 않습니다')
         if len(doc)>100:
             raise HTTPException(413,'100페이지 이하만 지원합니다')
-        pages=extract_pages(doc)
-        findings,missing=analyze_text(pages)
-        pdf=highlight(doc,findings)
+        pages = extract_pages(doc)
+        findings, missing = analyze_text(pages)
         doc.close()
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(422,'PDF 분석 실패: 파일 형식을 확인하세요')
+
+
+    # 기존 Regex 탐지 결과
+    print(
+        f"[Regex 위험 탐지] {len(findings)}건",
+        flush=True,
+    )
+
+    # GPT 기반 추가 위험 탐지
+    t_detect = time.perf_counter()
+
+    findings = attach_llm_detected_findings(
+        findings,
+        pages,
+    )
+
+    print(
+        f"[전체 위험 탐지] {len(findings)}건",
+        flush=True,
+    )
+    print(
+        f"[시간] GPT 위험 탐지: "
+        f"{time.perf_counter() - t_detect:.2f}초",
+        flush=True,
+    )
+
+    # GPT 탐지 결과까지 포함하여 PDF 하이라이트
+    try:
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            pdf = highlight(doc, findings)
+    except Exception as e:
+        print("[PDF 하이라이트 오류]", str(e), flush=True)
+        raise HTTPException(
+            422,
+            "PDF 하이라이트 생성에 실패했습니다",
+        )
+
 
     t0 = time.perf_counter()
 
